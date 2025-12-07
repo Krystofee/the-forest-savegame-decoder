@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Save files (don't commit actual saves)
+*.cs
+*.bin
+*.json
+__RESUME__*
+Slot*/
