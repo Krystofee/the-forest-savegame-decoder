@@ -306,29 +306,30 @@ def inject_cs_to_resume(resume_path: str, cs_path: str, output_path: str = None)
     """
     Inject player data from CS file into __RESUME__.
     This replaces the host's player data with data from the CS file.
+
+    IMPORTANT: This properly rebuilds the file to avoid data corruption.
     """
     if output_path is None:
         output_path = resume_path
 
     print(f"Loading __RESUME__: {resume_path}")
     header, inner, is_base64 = decode_resume(resume_path)
-    inner = bytearray(inner)
+    print(f"  Inner data size: {len(inner):,} bytes")
 
     print(f"Loading CS file: {cs_path}")
     cs_data = read_file(cs_path)
+    print(f"  CS file size: {len(cs_data):,} bytes")
 
     # Find objects in both files
-    resume_objects = find_object_boundaries(bytes(inner))
+    resume_objects = find_object_boundaries(inner)
     cs_objects = find_object_boundaries(cs_data)
 
     resume_player = [obj for obj in resume_objects if is_player_object(obj)]
     cs_player = [obj for obj in cs_objects if is_player_object(obj)]
 
+    print(f"\n__RESUME__ total objects: {len(resume_objects)}")
     print(f"__RESUME__ player objects: {len(resume_player)}")
     print(f"CS player objects: {len(cs_player)}")
-
-    # Strategy: Match objects by type and GUID, then replace data
-    # This is a simplified approach
 
     # Group objects by type
     def group_by_type(objects):
@@ -343,44 +344,79 @@ def inject_cs_to_resume(resume_path: str, cs_path: str, output_path: str = None)
     resume_groups = group_by_type(resume_player)
     cs_groups = group_by_type(cs_player)
 
-    # For each type present in both, replace __RESUME__ objects with CS objects
-    replacements = []
+    print("\nMatching by type:")
+    for type_name in sorted(set(resume_groups.keys()) | set(cs_groups.keys())):
+        r_count = len(resume_groups.get(type_name, []))
+        c_count = len(cs_groups.get(type_name, []))
+        marker = " *" if r_count != c_count else ""
+        print(f"  {type_name}: {r_count} -> {c_count}{marker}")
 
-    for type_name in resume_groups:
-        if type_name not in cs_groups:
-            continue
+    # Build replacement map: for each resume player object, find matching CS object
+    replacement_map = {}  # resume_obj_index -> cs_obj.data
 
-        resume_objs = resume_groups[type_name]
-        cs_objs = cs_groups[type_name]
+    # Track which CS objects we've used (by type)
+    cs_used = {t: 0 for t in cs_groups}
 
-        print(f"  {type_name}: {len(resume_objs)} in RESUME, {len(cs_objs)} in CS")
+    for i, obj in enumerate(resume_objects):
+        if is_player_object(obj):
+            type_key = obj.type_name.split('.')[-1]
+            if type_key in cs_groups and cs_used.get(type_key, 0) < len(cs_groups[type_key]):
+                # Get the next CS object of this type
+                cs_obj = cs_groups[type_key][cs_used[type_key]]
+                replacement_map[i] = cs_obj.data
+                cs_used[type_key] += 1
 
-        # Match by index (simplified - could match by GUID)
-        for i, resume_obj in enumerate(resume_objs):
-            if i < len(cs_objs):
-                cs_obj = cs_objs[i]
-                replacements.append((resume_obj, cs_obj))
+    print(f"\nWill replace {len(replacement_map)} player objects")
 
-    # Apply replacements (from end to start to preserve positions)
-    replacements.sort(key=lambda x: x[0].start, reverse=True)
+    # REBUILD THE FILE PROPERLY
+    # Go through all objects in order, replacing player objects with CS data
+    new_parts = []
+    prev_end = 0
 
-    for resume_obj, cs_obj in replacements:
-        # Replace the section
-        inner[resume_obj.start:resume_obj.end] = cs_obj.data
+    for i, obj in enumerate(resume_objects):
+        # Add any data between previous object and this one (gaps, headers, etc.)
+        if obj.start > prev_end:
+            new_parts.append(inner[prev_end:obj.start])
 
-    print(f"\nApplied {len(replacements)} replacements")
+        # Add object data (either original or replacement)
+        if i in replacement_map:
+            new_parts.append(replacement_map[i])
+        else:
+            new_parts.append(obj.data)
 
-    # Save
-    if output_path != resume_path:
-        # Create backup
-        if os.path.exists(resume_path):
-            backup = resume_path + f".backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            shutil.copy2(resume_path, backup)
-            print(f"Created backup: {backup}")
+        prev_end = obj.end
 
-    final = encode_resume(header, bytes(inner), is_base64)
+    # Add any trailing data after last object
+    if prev_end < len(inner):
+        new_parts.append(inner[prev_end:])
+
+    # Combine all parts
+    new_inner = b''.join(new_parts)
+
+    print(f"\nResult:")
+    print(f"  Original inner size: {len(inner):,} bytes")
+    print(f"  New inner size: {len(new_inner):,} bytes")
+    print(f"  Difference: {len(new_inner) - len(inner):+,} bytes")
+
+    # Create backup
+    if os.path.exists(output_path):
+        backup = output_path + f".backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        shutil.copy2(output_path, backup)
+        print(f"  Created backup: {backup}")
+
+    # Encode and save
+    final = encode_resume(header, new_inner, is_base64)
     write_file(output_path, final)
-    print(f"Saved to: {output_path} ({len(final):,} bytes)")
+    print(f"  Saved to: {output_path} ({len(final):,} bytes)")
+
+    # Verify
+    print("\nVerifying...")
+    _, verify_inner, _ = decode_resume(output_path)
+    verify_objects = find_object_boundaries(verify_inner)
+    print(f"  Objects in result: {len(verify_objects)} (was {len(resume_objects)})")
+
+    if len(verify_objects) != len(resume_objects):
+        print("  WARNING: Object count changed!")
 
 
 def compare_files(file1: str, file2: str):
